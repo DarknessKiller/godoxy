@@ -341,7 +341,7 @@ func loadDeleteIdlewatcherLabels(ctx context.Context, c *Container, helper conta
 		// Raw value: serialization parses comma-separated one-liners and YAML lists.
 		if raw := dependenciesLabel(c); raw != "" {
 			cfg[idlewatcherLabels[LabelDependsOn]] = raw
-		} else if deps := podmanDependencies(ctx, c.DockerCfg.URL, c.ContainerID); len(deps) > 0 {
+		} else if deps := podmanDependencies(ctx, c); len(deps) > 0 {
 			// podman-compose stores compose depends_on as podman --requires,
 			// which only the libpod API exposes.
 			cfg[idlewatcherLabels[LabelDependsOn]] = deps
