@@ -268,3 +268,94 @@ func TestIdlewatcherNotifyLabels(t *testing.T) {
 		})
 	}
 }
+
+func TestIdlewatcherDependsOn(t *testing.T) {
+	tests := []struct {
+		name   string
+		labels map[string]string
+		want   []string
+	}{
+		{
+			name: "proxy label only",
+			labels: map[string]string{
+				"proxy.idle_timeout": "1s",
+				"proxy.depends_on":   "db",
+			},
+			want: []string{"db"},
+		},
+		{
+			name: "compose label only",
+			labels: map[string]string{
+				"proxy.idle_timeout":            "1s",
+				"com.docker.compose.depends_on": "db:service_started:false",
+			},
+			want: []string{"db:service_started:false"},
+		},
+		{
+			name: "proxy label wins over compose label",
+			labels: map[string]string{
+				"proxy.idle_timeout":            "1s",
+				"proxy.depends_on":              "cache",
+				"com.docker.compose.depends_on": "db:service_started:false",
+			},
+			want: []string{"cache"},
+		},
+		{
+			name: "spaces and multiple dependencies",
+			labels: map[string]string{
+				"proxy.idle_timeout": "1s",
+				"proxy.depends_on":   "db, cache",
+			},
+			want: []string{"db", "cache"},
+		},
+		{
+			name: "multiline yaml list",
+			labels: map[string]string{
+				"proxy.idle_timeout": "1s",
+				"proxy.depends_on":   "- redis:service_healthy\n- postgres:service_started",
+			},
+			want: []string{"redis:service_healthy", "postgres:service_started"},
+		},
+		{
+			name: "no dependency labels",
+			labels: map[string]string{
+				"proxy.idle_timeout": "1s",
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := idlewatcherFromLabels(t, tc.labels)
+
+			require.Nil(t, c.Errors)
+			require.NotNil(t, c.IdlewatcherConfig)
+			require.Equal(t, tc.want, c.IdlewatcherConfig.DependsOn)
+			require.NotContains(t, c.Labels, "proxy.depends_on")
+		})
+	}
+}
+
+func TestDependenciesParsing(t *testing.T) {
+	tests := []struct {
+		name   string
+		labels map[string]string
+		want   []string
+	}{
+		{name: "single", labels: map[string]string{"proxy.depends_on": "db"}, want: []string{"db"}},
+		{name: "comma list", labels: map[string]string{"proxy.depends_on": "db,cache"}, want: []string{"db", "cache"}},
+		{name: "space list", labels: map[string]string{"proxy.depends_on": "db cache"}, want: []string{"db", "cache"}},
+		{name: "yaml list", labels: map[string]string{"proxy.depends_on": "- db\n- cache"}, want: []string{"db", "cache"}},
+		{name: "inline list", labels: map[string]string{"proxy.depends_on": "[db, cache]"}, want: []string{"db", "cache"}},
+		{name: "unset", labels: map[string]string{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := FromDocker(t.Context(), &container.Summary{
+				Names:  []string{"test"},
+				State:  "exited",
+				Labels: tc.labels,
+			}, types.DockerProviderConfig{})
+			require.Equal(t, tc.want, Dependencies(c))
+		})
+	}
+}
