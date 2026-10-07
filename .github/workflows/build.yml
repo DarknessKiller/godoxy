@@ -37,3 +37,15 @@ jobs:
           name: godoxy-linux-amd64
           path: godoxy
           if-no-files-found: error
+
+  docker:
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/docker-image.yml
+    with:
+      image_name: ${{ github.repository_owner }}/godoxy
+      tag: latest
+      target: main
