@@ -19,6 +19,7 @@ import (
 	"github.com/yusing/godoxy/internal/serialization"
 	"github.com/yusing/godoxy/internal/types"
 	gperr "github.com/yusing/goutils/errs"
+	strutils "github.com/yusing/goutils/strings"
 )
 
 var DummyContainer = new(Container)
@@ -89,7 +90,7 @@ func FromDocker(ctx context.Context, c *container.Summary, dockerCfg types.Docke
 
 	setPrivateHostname(res, helper)
 	setPublicHostname(res)
-	loadDeleteIdlewatcherLabels(res, helper)
+	loadDeleteIdlewatcherLabels(ctx, res, helper)
 
 	if res.PrivateHostname == "" && res.PublicHostname == "" && res.Running {
 		addError(res, ErrNoNetwork)
@@ -182,12 +183,32 @@ func DockerComposeService(c *Container) string {
 	return c.Labels["com.docker.compose.service"]
 }
 
-func Dependencies(c *Container) []string {
-	deps := c.Labels[LabelDependsOn]
-	if deps == "" {
-		deps = c.Labels["com.docker.compose.depends_on"]
+// dependenciesLabel returns the raw dependency list from proxy.depends_on,
+// falling back to the docker compose label.
+func dependenciesLabel(c *Container) string {
+	// ActualLabels is read instead of Labels: the idlewatcher label pass
+	// deletes proxy.depends_on before the config is built.
+	if deps := c.ActualLabels[LabelDependsOn]; deps != "" {
+		return deps
 	}
-	return strings.Split(deps, ",")
+	return c.ActualLabels["com.docker.compose.depends_on"]
+}
+
+// Dependencies parses the container dependency label.
+// One-liners are comma or space separated; multiline and list-like values are
+// YAML, matching the idlewatcher config deserialization.
+func Dependencies(c *Container) []string {
+	raw := dependenciesLabel(c)
+	if raw == "" {
+		return nil
+	}
+	if strings.IndexByte(raw, '\n') != -1 || raw[0] == '-' || raw[0] == '[' {
+		var deps []string
+		if err := strutils.UnmarshalYAML([]byte(raw), &deps); err == nil {
+			return deps
+		}
+	}
+	return strutils.CommaSeperatedList(raw)
 }
 
 var databaseMPs = map[string]struct{}{
@@ -298,20 +319,32 @@ func setPrivateHostname(c *Container, helper containerHelper) {
 	}
 }
 
-func loadDeleteIdlewatcherLabels(c *Container, helper containerHelper) {
+func loadDeleteIdlewatcherLabels(ctx context.Context, c *Container, helper containerHelper) {
 	hasIdleTimeout := false
 	cfg := make(map[string]any, len(idlewatcherLabels))
 	for lbl, key := range idlewatcherLabels {
 		value := helper.getDeleteLabel(lbl)
+		if lbl == LabelDependsOn {
+			// Resolved after the loop so the podman fallback only runs for
+			// containers that actually have an idle timeout.
+			continue
+		}
 		if value == "" {
 			continue
 		}
 		cfg[key] = value
-		switch lbl {
-		case LabelIdleTimeout:
+		if lbl == LabelIdleTimeout {
 			hasIdleTimeout = true
-		case LabelDependsOn:
-			cfg[key] = Dependencies(c)
+		}
+	}
+	if hasIdleTimeout {
+		// Raw value: serialization parses comma-separated one-liners and YAML lists.
+		if raw := dependenciesLabel(c); raw != "" {
+			cfg[idlewatcherLabels[LabelDependsOn]] = raw
+		} else if deps := podmanDependencies(ctx, c.DockerCfg.URL, c.ContainerID); len(deps) > 0 {
+			// podman-compose stores compose depends_on as podman --requires,
+			// which only the libpod API exposes.
+			cfg[idlewatcherLabels[LabelDependsOn]] = deps
 		}
 	}
 

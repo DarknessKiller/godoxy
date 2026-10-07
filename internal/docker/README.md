@@ -323,6 +323,10 @@ Those are created by Docker Compose.
 | `com.docker.compose.service`    | Service name         |
 | `com.docker.compose.depends_on` | Dependencies         |
 
+On podman-compose, `depends_on` is stored as podman `--requires` and is read
+through the libpod API on the same unix socket. Behind a Docker-API-only proxy
+(socket-proxy, TCP), set `proxy.depends_on` instead.
+
 ## Dependency and Integration Map
 
 ### Internal dependencies
