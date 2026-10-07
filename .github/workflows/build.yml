@@ -38,7 +38,18 @@ jobs:
           path: godoxy
           if-no-files-found: error
 
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      image_owner: ${{ steps.owner.outputs.value }}
+    steps:
+      - name: Lowercase repository owner
+        id: owner
+        # ghcr rejects uppercase owners.
+        run: echo "value=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
   docker:
+    needs: meta
     permissions:
       contents: read
       packages: write
@@ -46,7 +57,6 @@ jobs:
       attestations: write
     uses: ./.github/workflows/docker-image.yml
     with:
-      # ghcr requires lowercase; owner is DarknessKiller.
-      image_name: darknesskiller/godoxy
+      image_name: ${{ needs.meta.outputs.image_owner }}/godoxy
       tag: latest
       target: main
