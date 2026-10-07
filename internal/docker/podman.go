@@ -10,10 +10,12 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/yusing/godoxy/agent/pkg/agent"
 )
 
 // podmanLibpodAPIVersion is the libpod API version used for dependency lookup.
-// Podman 4 and newer keep serving this version on the same unix socket as the
+// Podman 4 and newer keep serving this version on the same socket as the
 // Docker-compatible API.
 const podmanLibpodAPIVersion = "v4.0.0"
 
@@ -25,16 +27,53 @@ const podmanRequestTimeout = 3 * time.Second
 // only exposed by the libpod API, not by the Docker-compatible API. Returns
 // compose service names when known, container names otherwise, and nil for
 // non-podman hosts or when the libpod API is unreachable.
-func podmanDependencies(ctx context.Context, host, containerID string) []string {
-	socketPath, ok := unixSocketPath(host)
-	if !ok || containerID == "" {
+func podmanDependencies(ctx context.Context, c *Container) []string {
+	if c.ContainerID == "" {
 		return nil
 	}
+	httpClient, base, ok := podmanEndpoint(c)
+	if !ok {
+		return nil
+	}
+	return fetchPodmanDependencies(ctx, httpClient, base, c.ContainerID)
+}
 
+// podmanEndpoint returns the HTTP client and base URL that reach the host's
+// libpod API, either through a local unix socket or an agent-managed host.
+func podmanEndpoint(c *Container) (*http.Client, string, bool) {
+	if agent.IsDockerHostAgent(c.DockerCfg.URL) {
+		if c.Agent == nil {
+			return nil, "", false
+		}
+		// The agent forwards any path to its docker/podman socket.
+		return c.Agent.HTTPClient(), agent.DockerHost, true
+	}
+	socketPath, ok := unixSocketPath(c.DockerCfg.URL)
+	if !ok {
+		return nil, "", false
+	}
+	return unixHTTPClient(socketPath), "http://podman", true
+}
+
+func unixHTTPClient(socketPath string) *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var dialer net.Dialer
+				return dialer.DialContext(ctx, "unix", socketPath)
+			},
+		},
+	}
+}
+
+func fetchPodmanDependencies(ctx context.Context, httpClient *http.Client, base, containerID string) []string {
 	ctx, cancel := context.WithTimeout(ctx, podmanRequestTimeout)
 	defer cancel()
 
-	pc := newPodmanClient(socketPath)
+	pc := &podmanClient{
+		base: strings.TrimSuffix(base, "/") + "/" + podmanLibpodAPIVersion + "/libpod",
+		http: httpClient,
+	}
 
 	var inspect struct {
 		Dependencies []string `json:"Dependencies"`
@@ -98,20 +137,6 @@ func unixSocketPath(host string) (string, bool) {
 type podmanClient struct {
 	base string
 	http *http.Client
-}
-
-func newPodmanClient(socketPath string) *podmanClient {
-	return &podmanClient{
-		base: "http://podman/" + podmanLibpodAPIVersion + "/libpod",
-		http: &http.Client{
-			Transport: &http.Transport{
-				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-					var dialer net.Dialer
-					return dialer.DialContext(ctx, "unix", socketPath)
-				},
-			},
-		},
-	}
 }
 
 func (c *podmanClient) get(ctx context.Context, path string, v any) error {
