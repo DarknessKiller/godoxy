@@ -46,6 +46,7 @@ jobs:
       attestations: write
     uses: ./.github/workflows/docker-image.yml
     with:
-      image_name: ${{ github.repository_owner }}/godoxy
+      # ghcr requires lowercase; owner is DarknessKiller.
+      image_name: darknesskiller/godoxy
       tag: latest
       target: main
