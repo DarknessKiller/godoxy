@@ -586,8 +586,14 @@ func (w *Watcher) stopDependencies() error {
 	errs := errgroup.Group{}
 	for _, dep := range dependencies {
 		if dep.Watcher.inUseByOtherWatchers(w) {
+			w.l.Info().Str("dep", dep.cfg.ContainerName()).Msg("dependency in use by another watcher, skipping")
 			continue
 		}
+		if dep.Watcher.inUseByAlwaysOnRoute() {
+			w.l.Info().Str("dep", dep.cfg.ContainerName()).Msg("dependency in use by an always-on route, skipping")
+			continue
+		}
+		w.l.Info().Str("dep", dep.cfg.ContainerName()).Msg("dependency not in use, stopping")
 		errs.Go(dep.stopByMethod)
 	}
 	return errs.Wait()
