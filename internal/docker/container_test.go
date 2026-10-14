@@ -307,3 +307,17 @@ func TestDependenciesWithoutLabels(t *testing.T) {
 	c := idlewatcherFromLabels(t, map[string]string{LabelIdleTimeout: "1m"})
 	expect.Equal(t, len(Dependencies(c)), 0)
 }
+
+func TestDependenciesYamlList(t *testing.T) {
+	c := idlewatcherFromLabels(t, map[string]string{
+		LabelIdleTimeout: "1m",
+		LabelDependsOn:   "- backend:service_started\n#- navidrome: service_started\n",
+	})
+	expect.Equal(t, Dependencies(c), []string{"backend:service_started"})
+
+	c = idlewatcherFromLabels(t, map[string]string{
+		LabelIdleTimeout: "1m",
+		LabelDependsOn:   "backend:service_started,other",
+	})
+	expect.Equal(t, Dependencies(c), []string{"backend:service_started", "other"})
+}

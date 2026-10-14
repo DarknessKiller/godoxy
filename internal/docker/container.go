@@ -198,7 +198,27 @@ func Dependencies(c *Container) []string {
 	if deps == "" {
 		return c.nativeDependencies
 	}
-	return strings.Split(deps, ",")
+	return parseDependsOn(deps)
+}
+
+// parseDependsOn accepts the label as a comma-separated list
+// ("a:service_started,b") or a YAML list ("- a:service_started"), where
+// lines that are not "- " entries are comments or keys.
+func parseDependsOn(deps string) []string {
+	if !strings.Contains(deps, "\n") {
+		return strings.Split(deps, ",")
+	}
+	var out []string
+	for _, line := range strings.Split(deps, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "- ") {
+			continue
+		}
+		if entry := strings.TrimSpace(line[2:]); entry != "" {
+			out = append(out, entry)
+		}
+	}
+	return out
 }
 
 var databaseMPs = map[string]struct{}{
