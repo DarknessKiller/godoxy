@@ -632,6 +632,7 @@ func (w *Watcher) stopByMethod() error {
 	var err error
 	p := w.provider.Load()
 	if p == nil {
+		w.stopping.Store(false)
 		return errors.New("provider not set")
 	}
 	switch cfg.StopMethod {
@@ -646,6 +647,7 @@ func (w *Watcher) stopByMethod() error {
 	}
 
 	if err != nil {
+		w.stopping.Store(false)
 		return w.newWatcherError(err)
 	}
 

@@ -427,7 +427,8 @@ func TestNewWatcherReloadRefreshesDependencySettings(t *testing.T) {
 // can assert which containers were stopped.
 type recordingIdlewatcherProvider struct {
 	idlewatcherTestRuntimeProvider
-	record func(action string)
+	record  func(action string)
+	stopErr error
 }
 
 func (p *recordingIdlewatcherProvider) ContainerStart(context.Context) error {
@@ -437,7 +438,7 @@ func (p *recordingIdlewatcherProvider) ContainerStart(context.Context) error {
 
 func (p *recordingIdlewatcherProvider) ContainerStop(context.Context, idlewatchertypes.Signal, int) error {
 	p.record("stop")
-	return nil
+	return p.stopErr
 }
 
 // fakeHealthMonitor is a mutable health monitor for entrypoint routes.
@@ -459,21 +460,25 @@ func (m *fakeHealthMonitor) MarshalZerologObject(e *zerolog.Event) {
 	e.Str("status", m.status.String())
 }
 
-func newRecordingProvider(t *testing.T, record func(action, id string)) {
+func newRecordingProvider(t *testing.T, record func(action, id string)) map[string]*recordingIdlewatcherProvider {
 	t.Helper()
+	providers := make(map[string]*recordingIdlewatcherProvider)
 	oldDockerProvider := newDockerProvider
 	oldProxmoxProvider := newProxmoxProvider
 	newDockerProvider = func(_ context.Context, _ godoxytypes.DockerProviderConfig, id string) (idlewatchertypes.Provider, error) {
-		return &recordingIdlewatcherProvider{
+		p := &recordingIdlewatcherProvider{
 			idlewatcherTestRuntimeProvider: idlewatcherTestRuntimeProvider{closes: &atomic.Int64{}},
 			record:                         func(action string) { record(action, id) },
-		}, nil
+		}
+		providers[id] = p
+		return p, nil
 	}
 	newProxmoxProvider = func(_ context.Context, _ string, _ uint64) (idlewatchertypes.Provider, error) {
-		return &recordingIdlewatcherProvider{
+		p := &recordingIdlewatcherProvider{
 			idlewatcherTestRuntimeProvider: idlewatcherTestRuntimeProvider{closes: &atomic.Int64{}},
 			record:                         func(action string) { record(action, "") },
-		}, nil
+		}
+		return p, nil
 	}
 	t.Cleanup(func() {
 		newDockerProvider = oldDockerProvider
@@ -483,6 +488,7 @@ func newRecordingProvider(t *testing.T, record func(action, id string)) {
 		clear(watcherMap)
 		watcherMapMu.Unlock()
 	})
+	return providers
 }
 
 func recordedActions(mu *sync.Mutex, actions *[]string) []string {
@@ -604,6 +610,50 @@ func TestStopDependenciesConcurrentIdlesStopSharedDependencyOnce(t *testing.T) {
 	require.Equal(t, 1, depStops, "shared dependency must stop exactly once")
 	require.Contains(t, acts, "stop:main")
 	require.Contains(t, acts, "stop:other")
+}
+
+// A failed stop leaves the container running and still using its
+// dependencies: the stopping mark must be cleared so the watcher pins them
+// again. Otherwise a shared dependency could be stopped while a running
+// dependent's Wake() is a no-op (ready watchers return early).
+func TestStopFailureKeepsWatcherPinning(t *testing.T) {
+	var mu sync.Mutex
+	var actions []string
+	providers := newRecordingProvider(t, func(action, id string) { appendAction(&mu, &actions, action, id) })
+
+	parent := task.GetTestTask(t).Subtask("idlewatcher_stop_failure", true)
+	t.Cleanup(func() { parent.FinishAndWait(nil) })
+
+	routeProvider := &idlewatcherTestRouteProvider{routes: make(map[string]routing.Route)}
+	newDependent := func(id string) *idlewatcherTestRoute {
+		cfg := idlewatcherTestConfig(id, []string{"dep"})
+		cfg.StopMethod = idlewatchertypes.ContainerStopMethodStop
+		return newIdlewatcherTestRoute(id, routeProvider, cfg)
+	}
+	mainRoute := newDependent("main")
+	otherRoute := newDependent("other")
+	depRoute := newIdlewatcherTestRoute("dep", routeProvider, nil)
+	routeProvider.routes["main"] = mainRoute
+	routeProvider.routes["other"] = otherRoute
+	routeProvider.routes["dep"] = depRoute
+
+	w1, err := NewWatcher(parent, mainRoute, mainRoute.cfg)
+	require.NoError(t, err)
+	w2, err := NewWatcher(parent, otherRoute, otherRoute.cfg)
+	require.NoError(t, err)
+	dep := w1.dependsOn[0].Watcher
+	setRunning(w1, w2, dep)
+	providers["main"].stopErr = errors.New("stop failed")
+
+	// w1's stop fails: it stays running and must keep pinning the dependency.
+	require.Error(t, w1.stopByMethod())
+	mu.Lock()
+	actions = nil
+	mu.Unlock()
+
+	require.NoError(t, w2.stopByMethod())
+	require.Equal(t, []string{"stop:other"}, recordedActions(&mu, &actions),
+		"dependency must stay running while the failed-stop watcher is still up")
 }
 
 // Part 2: an always-on route has no watcher in watcherMap; a dependency it
