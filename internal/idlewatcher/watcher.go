@@ -594,13 +594,12 @@ func (w *Watcher) stopDependencies() error {
 }
 
 // inUseByOtherWatchers reports whether a running watcher other than self
-// directly depends on w. A dependency shared by several routes is kept running
-// until the last of them stops; wake is transitive, so a sleeping dependent
-// wakes it again on demand.
+// directly depends on w, or an always-on route names w's container as a
+// dependency. A dependency shared by several routes is kept running until the
+// last of them stops; wake is transitive, so a sleeping dependent wakes it
+// again on demand.
 func (w *Watcher) inUseByOtherWatchers(self *Watcher) bool {
 	watcherMapMu.RLock()
-	defer watcherMapMu.RUnlock()
-
 	for _, other := range watcherMap {
 		if other == self || !other.running() {
 			continue
@@ -608,10 +607,56 @@ func (w *Watcher) inUseByOtherWatchers(self *Watcher) bool {
 		if slices.ContainsFunc(other.directDependencies(), func(dep *dependency) bool {
 			return dep.Watcher == w
 		}) {
+			watcherMapMu.RUnlock()
 			return true
 		}
 	}
-	return false
+	watcherMapMu.RUnlock()
+	return w.inUseByAlwaysOnRoute()
+}
+
+// inUseByAlwaysOnRoute reports whether a route with no idle watcher of its
+// own — invisible to watcherMap — depends on w's container and is not down.
+// Compose depends_on semantics keep such a dependency running.
+func (w *Watcher) inUseByAlwaysOnRoute() bool {
+	if w.cfg.Docker == nil {
+		return false
+	}
+	ep := entrypoint.FromCtx(w.task.Context())
+	if ep == nil {
+		return false
+	}
+	statuses := ep.GetHealthInfoSimple()
+	inUse := false
+	ep.IterRoutes(func(r routing.Route) bool {
+		if r.IdlewatcherConfig() != nil {
+			return true // watcher-managed, covered by the watcher scan
+		}
+		cont := r.ContainerInfo()
+		if cont == nil {
+			return true
+		}
+		for _, dep := range docker.Dependencies(cont) {
+			name, _, _ := strings.Cut(dep, ":")
+			if name == "" {
+				continue
+			}
+			depRoute, ok := r.GetProvider().FindService(docker.DockerComposeProject(cont), name)
+			if !ok {
+				depRoute, ok = ep.GetRoute(name)
+			}
+			if !ok || depRoute.ContainerInfo() == nil ||
+				depRoute.ContainerInfo().ContainerID != w.cfg.Docker.ContainerID {
+				continue
+			}
+			if status, ok := statuses[r.Name()]; !ok || status != health.StatusUnhealthy {
+				inUse = true
+				return false
+			}
+		}
+		return true
+	})
+	return inUse
 }
 
 func (w *Watcher) stopByMethod() error {

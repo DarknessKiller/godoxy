@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/yusing/godoxy/internal/agentpool"
 	"github.com/yusing/godoxy/internal/docker"
+	"github.com/yusing/godoxy/internal/entrypoint"
 	"github.com/yusing/godoxy/internal/health"
 	"github.com/yusing/godoxy/internal/homepage"
 	idlewatchertypes "github.com/yusing/godoxy/internal/idlewatcher/runtime"
@@ -473,4 +474,63 @@ func TestStopDependenciesKeepsSharedDependency(t *testing.T) {
 	other.state.Store(&containerState{status: idlewatchertypes.ContainerStatusStopped})
 	require.NoError(t, dependent.stopDependencies())
 	require.EqualValues(t, 1, sharedProvider.stops.Load(), "shared dependency not stopped after the last dependent stopped")
+}
+
+type idlewatcherTestEntrypoint struct {
+	routing.Entrypoint
+	routes   []routing.Route
+	byName   map[string]routing.Route
+	statuses map[string]health.HealthStatus
+}
+
+func (ep *idlewatcherTestEntrypoint) IterRoutes(yield func(routing.Route) bool) {
+	for _, r := range ep.routes {
+		if !yield(r) {
+			return
+		}
+	}
+}
+
+func (ep *idlewatcherTestEntrypoint) GetRoute(alias string) (routing.Route, bool) {
+	r, ok := ep.byName[alias]
+	return r, ok
+}
+
+func (ep *idlewatcherTestEntrypoint) NumRoutes() int { return len(ep.routes) }
+
+func (ep *idlewatcherTestEntrypoint) GetHealthInfoSimple() map[string]health.HealthStatus {
+	return ep.statuses
+}
+
+func TestStopDependenciesKeepsAlwaysOnDependent(t *testing.T) {
+	shared := newTestWatcher(t)
+	dependent := newTestWatcher(t)
+
+	shared.cfg.StopMethod = idlewatchertypes.ContainerStopMethodStop
+	sharedProvider := &stopRecordingProvider{}
+	shared.provider.Store(sharedProvider)
+	shared.state.Store(&containerState{status: idlewatchertypes.ContainerStatusRunning})
+	dependent.dependsOn = []*dependency{{Watcher: shared}}
+
+	provider := &idlewatcherTestRouteProvider{routes: make(map[string]routing.Route)}
+	// an always-on route (no idlewatcher config) depending on shared's container
+	alwaysOn := newIdlewatcherTestRoute("always-on", provider, nil)
+	alwaysOn.container.Labels["com.docker.compose.depends_on"] = "shared"
+	sharedRoute := newIdlewatcherTestRoute("shared", provider, nil)
+	sharedRoute.container.ContainerID = shared.cfg.Docker.ContainerID
+	provider.routes["shared"] = sharedRoute
+
+	ep := &idlewatcherTestEntrypoint{
+		routes:   []routing.Route{alwaysOn},
+		byName:   map[string]routing.Route{"always-on": alwaysOn},
+		statuses: map[string]health.HealthStatus{"always-on": health.StatusHealthy},
+	}
+	entrypoint.SetCtx(shared.task, ep)
+
+	require.NoError(t, dependent.stopDependencies())
+	require.Zero(t, sharedProvider.stops.Load(), "dependency stopped while an always-on route depends on it")
+
+	ep.statuses["always-on"] = health.StatusUnhealthy
+	require.NoError(t, dependent.stopDependencies())
+	require.EqualValues(t, 1, sharedProvider.stops.Load(), "dependency not stopped after the always-on route went down")
 }
