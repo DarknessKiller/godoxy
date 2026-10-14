@@ -89,7 +89,7 @@ func FromDocker(ctx context.Context, c *container.Summary, dockerCfg types.Docke
 
 	setPrivateHostname(res, helper)
 	setPublicHostname(res)
-	loadDeleteIdlewatcherLabels(res, helper)
+	loadDeleteIdlewatcherLabels(ctx, res, helper)
 
 	if res.PrivateHostname == "" && res.PublicHostname == "" && res.Running {
 		addError(res, ErrNoNetwork)
@@ -309,12 +309,12 @@ func setPrivateHostname(c *Container, helper containerHelper) {
 	}
 }
 
-func loadDeleteIdlewatcherLabels(c *Container, helper containerHelper) {
+func loadDeleteIdlewatcherLabels(ctx context.Context, c *Container, helper containerHelper) {
 	hasIdleTimeout := false
 	cfg := make(map[string]any, len(idlewatcherLabels))
 	for lbl, key := range idlewatcherLabels {
 		value := helper.getDeleteLabel(lbl)
-		if value == "" {
+		if value == "" && lbl != LabelDependsOn {
 			continue
 		}
 		cfg[key] = value
@@ -322,7 +322,12 @@ func loadDeleteIdlewatcherLabels(c *Container, helper containerHelper) {
 		case LabelIdleTimeout:
 			hasIdleTimeout = true
 		case LabelDependsOn:
-			cfg[key] = Dependencies(c)
+			deps := Dependencies(c)
+			if len(deps) == 0 {
+				// podman-compose stores compose depends_on as podman --requires
+				deps = podmanDependencies(ctx, c)
+			}
+			cfg[key] = deps
 		}
 	}
 

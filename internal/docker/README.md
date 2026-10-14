@@ -323,6 +323,17 @@ Those are created by Docker Compose.
 | `com.docker.compose.service`    | Service name         |
 | `com.docker.compose.depends_on` | Dependencies         |
 
+Podman Compose sets no `com.docker.compose.depends_on`. It passes compose
+`depends_on` to Podman as `--requires`, which only the native libpod API reports.
+`podmanDependencies` in `podman.go` reads that API through the provider's
+connection, so TLS and agent providers work too and compose `depends_on` needs no
+`proxy.depends_on` label. `proxy.depends_on` wins when both are set.
+
+Dependency discovery runs one native inspect per podman-compose container and
+resolves dependency IDs from the provider's container snapshot. A failed inspect
+skips dependency resolution, and the provider still builds the container's
+routes.
+
 ## Dependency and Integration Map
 
 ### Internal dependencies
