@@ -15,7 +15,7 @@ The `internal/idlewatcher` package implements idle-based container lifecycle man
 ### Non-goals
 
 - Does not implement container runtime operations directly (delegates to providers)
-- Does not manage container dependencies beyond wake ordering
+- Does not manage container dependencies beyond wake ordering and stop-time sharing
 - Does not provide health checking (delegates to `internal/health/monitor`)
 
 ### Stability
@@ -139,6 +139,21 @@ classDiagram
     Watcher --> containerState : manages
     Watcher --> idlewatcher.Provider : uses
 ```
+
+### Dependency Stop Sharing
+
+Dependencies get `IdleTimeout = neverTick`, so they only stop via
+`stopDependencies()` when a dependent idles out. Before stopping a dependency,
+the watcher checks whether it is still in use:
+
+- `runningWatcherDependsOn` scans `watcherMap` for other running watchers whose
+  direct dependencies include the same container. A dependency shared by several
+  routes stays up until the last of them stops.
+- `entrypointRouteDependsOn` scans entrypoint routes and their container
+  dependency lists (via `docker.Dependencies`, which reads `ActualLabels` so the
+  consumed `proxy.depends_on` label is still visible). This covers always-on
+  routes, which have no idle timeout and therefore no watcher in `watcherMap`.
+  A down (`unhealthy`) route does not pin its dependency awake.
 
 ### Component Interactions
 

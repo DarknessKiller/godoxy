@@ -585,6 +585,11 @@ func (w *Watcher) stopDependencies() error {
 
 	errs := errgroup.Group{}
 	for _, dep := range dependencies {
+		if w.dependencyInUse(dep) {
+			w.l.Info().Str("dependency", dep.cfg.ContainerName()).
+				Msg("dependency still in use by other routes, keeping it running")
+			continue
+		}
 		errs.Go(dep.stopByMethod)
 	}
 	return errs.Wait()
@@ -633,6 +638,105 @@ func (w *Watcher) stopByMethod() error {
 		return w.newWatcherError(err)
 	}
 	return nil
+}
+
+// dependencyInUse reports whether dep must stay running because another route
+// still depends on it: either a running watcher's direct dependency, or a
+// healthy route via its container dependency labels.
+func (w *Watcher) dependencyInUse(dep *dependency) bool {
+	return w.runningWatcherDependsOn(dep) || w.entrypointRouteDependsOn(dep)
+}
+
+// runningWatcherDependsOn scans watcherMap for other running watchers that
+// directly depend on dep.
+func (w *Watcher) runningWatcherDependsOn(dep *dependency) bool {
+	watcherMapMu.RLock()
+	defer watcherMapMu.RUnlock()
+	for _, other := range watcherMap {
+		if other == w || other.Key() == dep.Key() {
+			continue
+		}
+		if !other.running() {
+			continue
+		}
+		for _, d := range other.directDependencies() {
+			if d.Key() == dep.Key() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// entrypointRouteDependsOn scans entrypoint routes for ones that depend on the
+// container watched by dep. Always-on routes have no idle timeout, so they have
+// no watcher in watcherMap and are invisible to runningWatcherDependsOn.
+// Routes are resolved the same way NewWatcher resolves dependency edges.
+// A down route does not pin its dependency awake.
+func (w *Watcher) entrypointRouteDependsOn(dep *dependency) bool {
+	ep := entrypoint.FromCtx(w.Task().Context())
+	if ep == nil {
+		return false
+	}
+	healthMap := ep.GetHealthInfoSimple()
+	for r := range ep.IterRoutes {
+		if cont := r.ContainerInfo(); cont == nil || cont.ContainerID == w.cfg.Key() {
+			// skip routes of the idling watcher's own container
+			continue
+		}
+		if !w.routeDependsOn(r, dep) {
+			continue
+		}
+		if status, ok := healthMap[r.Name()]; ok && status == health.StatusUnhealthy {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// routeDependsOn reports whether r's container declares a dependency on the
+// container watched by dep. Each dependency entry is resolved like NewWatcher
+// resolves them, so both compose service names and container names match.
+func (w *Watcher) routeDependsOn(r routing.Route, dep *dependency) bool {
+	cont := r.ContainerInfo()
+	if cont == nil {
+		return false
+	}
+	proj := docker.DockerComposeProject(cont)
+	for _, depEntry := range docker.Dependencies(cont) {
+		depName := depEntry
+		if i := strings.IndexByte(depName, ':'); i >= 0 {
+			depName = depName[:i]
+		}
+		if depName == "" {
+			continue
+		}
+		depRoute, ok := w.resolveDepRoute(r, proj, depName)
+		if !ok {
+			continue
+		}
+		depCont := depRoute.ContainerInfo()
+		if depCont == nil || depCont == cont { // self-dependency does not pin
+			continue
+		}
+		if depCont.ContainerID == dep.cfg.Key() {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *Watcher) resolveDepRoute(r routing.Route, proj, depName string) (routing.Route, bool) {
+	if proj != "" {
+		if depRoute, ok := r.GetProvider().FindService(proj, depName); ok {
+			return depRoute, true
+		}
+	}
+	if ep := entrypoint.FromCtx(w.Task().Context()); ep != nil {
+		return ep.GetRoute(depName)
+	}
+	return nil, false
 }
 
 func (w *Watcher) resetIdleTimer() {

@@ -5,14 +5,17 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	dockerapi "github.com/docker/docker/api/types/container"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 	"github.com/yusing/godoxy/internal/agentpool"
 	"github.com/yusing/godoxy/internal/docker"
+	entrypoint "github.com/yusing/godoxy/internal/entrypoint"
 	"github.com/yusing/godoxy/internal/health"
 	"github.com/yusing/godoxy/internal/homepage"
 	idlewatchertypes "github.com/yusing/godoxy/internal/idlewatcher/runtime"
@@ -418,4 +421,199 @@ func TestNewWatcherReloadRefreshesDependencySettings(t *testing.T) {
 			require.Equal(t, updated, dep.cfg.IdlewatcherConfigBase)
 		})
 	}
+}
+
+// recordingIdlewatcherProvider records lifecycle actions per container so tests
+// can assert which containers were stopped.
+type recordingIdlewatcherProvider struct {
+	idlewatcherTestRuntimeProvider
+	record func(action string)
+}
+
+func (p *recordingIdlewatcherProvider) ContainerStart(context.Context) error {
+	p.record("start")
+	return nil
+}
+
+func (p *recordingIdlewatcherProvider) ContainerStop(context.Context, idlewatchertypes.Signal, int) error {
+	p.record("stop")
+	return nil
+}
+
+// fakeHealthMonitor is a mutable health monitor for entrypoint routes.
+type fakeHealthMonitor struct {
+	status health.HealthStatus
+}
+
+func (m *fakeHealthMonitor) Start(task.Parent) error      { return nil }
+func (m *fakeHealthMonitor) Finish(any)                   {}
+func (m *fakeHealthMonitor) Task() *task.Task             { return nil }
+func (m *fakeHealthMonitor) String() string               { return m.status.String() }
+func (m *fakeHealthMonitor) Status() health.HealthStatus  { return m.status }
+func (m *fakeHealthMonitor) Uptime() time.Duration        { return 0 }
+func (m *fakeHealthMonitor) Latency() time.Duration       { return 0 }
+func (m *fakeHealthMonitor) Detail() string               { return "" }
+func (m *fakeHealthMonitor) Name() string                 { return "fake" }
+func (m *fakeHealthMonitor) MarshalJSON() ([]byte, error) { return []byte(`"fake"`), nil }
+func (m *fakeHealthMonitor) MarshalZerologObject(e *zerolog.Event) {
+	e.Str("status", m.status.String())
+}
+
+func newRecordingProvider(t *testing.T, record func(action, id string)) {
+	t.Helper()
+	oldDockerProvider := newDockerProvider
+	oldProxmoxProvider := newProxmoxProvider
+	newDockerProvider = func(_ context.Context, _ godoxytypes.DockerProviderConfig, id string) (idlewatchertypes.Provider, error) {
+		return &recordingIdlewatcherProvider{
+			idlewatcherTestRuntimeProvider: idlewatcherTestRuntimeProvider{closes: &atomic.Int64{}},
+			record:                         func(action string) { record(action, id) },
+		}, nil
+	}
+	newProxmoxProvider = func(_ context.Context, _ string, _ uint64) (idlewatchertypes.Provider, error) {
+		return &recordingIdlewatcherProvider{
+			idlewatcherTestRuntimeProvider: idlewatcherTestRuntimeProvider{closes: &atomic.Int64{}},
+			record:                         func(action string) { record(action, "") },
+		}, nil
+	}
+	t.Cleanup(func() {
+		newDockerProvider = oldDockerProvider
+		newProxmoxProvider = oldProxmoxProvider
+
+		watcherMapMu.Lock()
+		clear(watcherMap)
+		watcherMapMu.Unlock()
+	})
+}
+
+func recordedActions(mu *sync.Mutex, actions *[]string) []string {
+	mu.Lock()
+	defer mu.Unlock()
+	return append([]string(nil), *actions...)
+}
+
+func appendAction(mu *sync.Mutex, actions *[]string, action, id string) {
+	mu.Lock()
+	defer mu.Unlock()
+	*actions = append(*actions, action+":"+id)
+}
+
+func setRunning(ws ...*Watcher) {
+	for _, w := range ws {
+		w.storeState(&containerState{status: idlewatchertypes.ContainerStatusRunning})
+	}
+}
+
+// Part 1: a dependency shared by several watchers must stay up until the last
+// of them stops.
+func TestStopDependenciesKeepsSharedDependencyForRunningWatcher(t *testing.T) {
+	var mu sync.Mutex
+	var actions []string
+	newRecordingProvider(t, func(action, id string) { appendAction(&mu, &actions, action, id) })
+
+	parent := task.GetTestTask(t).Subtask("idlewatcher_shared_dep", true)
+	t.Cleanup(func() { parent.FinishAndWait(nil) })
+
+	routeProvider := &idlewatcherTestRouteProvider{routes: make(map[string]routing.Route)}
+	newDependent := func(id string) *idlewatcherTestRoute {
+		cfg := idlewatcherTestConfig(id, []string{"dep"})
+		cfg.StopMethod = idlewatchertypes.ContainerStopMethodStop
+		return newIdlewatcherTestRoute(id, routeProvider, cfg)
+	}
+	mainRoute := newDependent("main")
+	otherRoute := newDependent("other")
+	depRoute := newIdlewatcherTestRoute("dep", routeProvider, nil)
+	routeProvider.routes["main"] = mainRoute
+	routeProvider.routes["other"] = otherRoute
+	routeProvider.routes["dep"] = depRoute
+
+	w1, err := NewWatcher(parent, mainRoute, mainRoute.cfg)
+	require.NoError(t, err)
+	w2, err := NewWatcher(parent, otherRoute, otherRoute.cfg)
+	require.NoError(t, err)
+	require.NotSame(t, w1, w2)
+	require.Same(t, w1.dependsOn[0].Watcher, w2.dependsOn[0].Watcher,
+		"shared dependency resolves to one watcher")
+	dep := w1.dependsOn[0].Watcher
+	setRunning(w1, w2, dep)
+
+	// w1 idles out; w2's watcher is still running, so the dependency stays up.
+	require.NoError(t, w1.stopByMethod())
+	require.Equal(t, []string{"stop:main"}, recordedActions(&mu, &actions))
+	mu.Lock()
+	actions = nil
+	mu.Unlock()
+
+	// Model the runtime's stop event for w1 before w2 idles out.
+	w1.storeState(&containerState{status: idlewatchertypes.ContainerStatusStopped})
+
+	require.NoError(t, w2.stopByMethod())
+	require.Equal(t, []string{"stop:other", "stop:dep-id"},
+		recordedActions(&mu, &actions))
+}
+
+// Part 2: an always-on route has no watcher in watcherMap; a dependency it
+// declares via container labels must stay up while the route is not down.
+// The route's container is built through docker.FromDocker so the
+// proxy.depends_on label path (label consumed during route construction,
+// read later from ActualLabels by Dependencies) is exercised end to end.
+func TestStopDependenciesKeepsDependencyForAlwaysOnRoute(t *testing.T) {
+	var mu sync.Mutex
+	var actions []string
+	newRecordingProvider(t, func(action, id string) { appendAction(&mu, &actions, action, id) })
+
+	parent := task.GetTestTask(t).Subtask("idlewatcher_always_on", true)
+	t.Cleanup(func() { parent.FinishAndWait(nil) })
+
+	ep := entrypoint.NewEntrypoint(parent, nil)
+	entrypoint.SetCtx(parent, ep)
+
+	routeProvider := &idlewatcherTestRouteProvider{routes: make(map[string]routing.Route)}
+	cfg := idlewatcherTestConfig("main-id", []string{"dep"})
+	cfg.StopMethod = idlewatchertypes.ContainerStopMethodStop
+	mainRoute := newIdlewatcherTestRoute("main", routeProvider, cfg)
+	depRoute := newIdlewatcherTestRoute("dep", routeProvider, nil)
+	// The guard resolves dependency entries through the compose project and
+	// service labels, the same way NewWatcher resolves them.
+	depRoute.container.Labels["com.docker.compose.service"] = "dep"
+	routeProvider.routes["main"] = mainRoute
+	routeProvider.routes["dep"] = depRoute
+
+	alwaysOn := newIdlewatcherTestRoute("always-on", routeProvider, nil)
+	alwaysOn.container = docker.FromDocker(t.Context(), &dockerapi.Summary{
+		Names: []string{"/always-on"},
+		State: "running",
+		Labels: map[string]string{
+			"com.docker.compose.project": "idlewatcher-test",
+			"com.docker.compose.service": "always-on",
+			docker.LabelDependsOn:        "dep:service_started",
+		},
+	}, godoxytypes.DockerProviderConfig{})
+	ep.ExcludedRoutes().Add(alwaysOn)
+
+	w, err := NewWatcher(parent, mainRoute, mainRoute.cfg)
+	require.NoError(t, err)
+	dep := w.dependsOn[0].Watcher
+	setRunning(w, dep)
+
+	// Route has no health monitor (status unknown): the dependency stays up.
+	require.NoError(t, w.stopByMethod())
+	require.Equal(t, []string{"stop:main-id"}, recordedActions(&mu, &actions))
+	mu.Lock()
+	actions = nil
+	mu.Unlock()
+
+	// Model the runtime's stop event, then a healthy route still pins.
+	w.storeState(&containerState{status: idlewatchertypes.ContainerStatusStopped})
+	mon := &fakeHealthMonitor{status: health.StatusHealthy}
+	alwaysOn.SetHealthMonitor(mon)
+	require.NoError(t, w.stopByMethod())
+	require.Empty(t, recordedActions(&mu, &actions))
+	mu.Lock()
+	actions = nil
+	mu.Unlock()
+
+	// A down route does not pin its dependency awake.
+	mon.status = health.StatusUnhealthy
+	require.NoError(t, w.stopByMethod())
+	require.Equal(t, []string{"stop:dep-id"}, recordedActions(&mu, &actions))
 }
