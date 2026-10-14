@@ -75,6 +75,11 @@ type (
 		eventsMu       sync.Mutex
 		lastIdleAction synk.Value[string]
 
+		// stopping is true from stopByMethod entry until the container starts
+		// again, so other watchers' dependency guards do not pin on stale
+		// running state while this watcher is (or was) going to sleep.
+		stopping atomic.Bool
+
 		dependenciesMu    sync.RWMutex
 		dependsOn         []*dependency
 		dependenciesCache synk.Value[*dependencyCache]
@@ -140,6 +145,7 @@ func NewWatcher(parent task.Parent, r routing.Route, cfg *Config) (*Watcher, err
 			w.cfg.IdlewatcherConfigBase = cfg.IdlewatcherConfigBase
 		}
 		cfg = w.cfg
+		w.stopping.Store(false) // route restarted, pins its dependencies again
 		w.resetIdleTimer()
 		// Update health monitor URL with current route info on reload
 		if targetURL := r.TargetURL(); targetURL != nil {
@@ -585,17 +591,29 @@ func (w *Watcher) stopDependencies() error {
 
 	errs := errgroup.Group{}
 	for _, dep := range dependencies {
-		if w.dependencyInUse(dep) {
-			w.l.Info().Str("dependency", dep.cfg.ContainerName()).
-				Msg("dependency still in use by other routes, keeping it running")
-			continue
-		}
-		errs.Go(dep.stopByMethod)
+		errs.Go(func() error {
+			// Merge concurrent stops of the same dependency (several dependents
+			// idling at the same time): the guard is re-checked inside the shared
+			// flight, so exactly one stop proceeds.
+			_, err, _ := singleFlight.Do("stop:"+dep.Key(), func() (any, error) {
+				if w.dependencyInUse(dep) {
+					w.l.Info().Str("dependency", dep.cfg.ContainerName()).
+						Msg("dependency still in use by other routes, keeping it running")
+					return nil, nil
+				}
+				return nil, dep.stopByMethod()
+			})
+			return err
+		})
 	}
 	return errs.Wait()
 }
 
 func (w *Watcher) stopByMethod() error {
+	// Mark stopping before anything else: other watchers' dependency guards
+	// must not pin on this watcher's stale running state.
+	w.stopping.Store(true)
+
 	// no need singleflight here because it will only be called once every tick.
 
 	// if the container is not running, skip and stop dependencies.
@@ -656,7 +674,7 @@ func (w *Watcher) runningWatcherDependsOn(dep *dependency) bool {
 		if other == w || other.Key() == dep.Key() {
 			continue
 		}
-		if !other.running() {
+		if !other.running() || other.stopping.Load() {
 			continue
 		}
 		for _, d := range other.directDependencies() {

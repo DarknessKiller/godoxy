@@ -41,6 +41,7 @@ func (w *Watcher) setReady() {
 func (w *Watcher) setStarting() {
 	alreadyStarting := w.wakeInProgress()
 	now := time.Now()
+	w.stopping.Store(false)
 	previous := w.storeState(&containerState{
 		status:    idlewatcher.ContainerStatusRunning,
 		ready:     false,

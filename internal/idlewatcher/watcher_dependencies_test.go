@@ -551,6 +551,61 @@ func TestStopDependenciesKeepsSharedDependencyForRunningWatcher(t *testing.T) {
 		recordedActions(&mu, &actions))
 }
 
+// Race: dependents idling at the same time must still stop the shared
+// dependency, exactly once. Without the stopping flag and the stop flight,
+// both guards see each other's stale running state and both skip, leaving
+// the dependency running forever.
+func TestStopDependenciesConcurrentIdlesStopSharedDependencyOnce(t *testing.T) {
+	var mu sync.Mutex
+	var actions []string
+	newRecordingProvider(t, func(action, id string) { appendAction(&mu, &actions, action, id) })
+
+	parent := task.GetTestTask(t).Subtask("idlewatcher_concurrent", true)
+	t.Cleanup(func() { parent.FinishAndWait(nil) })
+
+	routeProvider := &idlewatcherTestRouteProvider{routes: make(map[string]routing.Route)}
+	newDependent := func(id string) *idlewatcherTestRoute {
+		cfg := idlewatcherTestConfig(id, []string{"dep"})
+		cfg.StopMethod = idlewatchertypes.ContainerStopMethodStop
+		return newIdlewatcherTestRoute(id, routeProvider, cfg)
+	}
+	mainRoute := newDependent("main")
+	otherRoute := newDependent("other")
+	depRoute := newIdlewatcherTestRoute("dep", routeProvider, nil)
+	routeProvider.routes["main"] = mainRoute
+	routeProvider.routes["other"] = otherRoute
+	routeProvider.routes["dep"] = depRoute
+
+	w1, err := NewWatcher(parent, mainRoute, mainRoute.cfg)
+	require.NoError(t, err)
+	w2, err := NewWatcher(parent, otherRoute, otherRoute.cfg)
+	require.NoError(t, err)
+	dep := w1.dependsOn[0].Watcher
+	setRunning(w1, w2, dep)
+
+	// Both dependents idle out at the same time.
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	wg.Go(func() { errs <- w1.stopByMethod() })
+	wg.Go(func() { errs <- w2.stopByMethod() })
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	acts := recordedActions(&mu, &actions)
+	depStops := 0
+	for _, a := range acts {
+		if a == "stop:dep-id" {
+			depStops++
+		}
+	}
+	require.Equal(t, 1, depStops, "shared dependency must stop exactly once")
+	require.Contains(t, acts, "stop:main")
+	require.Contains(t, acts, "stop:other")
+}
+
 // Part 2: an always-on route has no watcher in watcherMap; a dependency it
 // declares via container labels must stay up while the route is not down.
 // The route's container is built through docker.FromDocker so the
