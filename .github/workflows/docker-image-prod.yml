@@ -12,9 +12,3 @@ jobs:
       image_name: ${{ github.repository_owner }}/godoxy
       tag: latest
       target: main
-  build-prod-agent:
-    uses: ./.github/workflows/docker-image.yml
-    with:
-      image_name: ${{ github.repository_owner }}/godoxy-agent
-      tag: latest
-      target: agent

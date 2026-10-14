@@ -114,16 +114,3 @@ jobs:
       image_name: ${{ github.repository_owner }}/godoxy
       tag: nightly
       target: main
-  build-nightly-agent:
-    needs: gate
-    if: needs.gate.outputs.run == 'true'
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-      attestations: write
-    uses: ./.github/workflows/docker-image.yml
-    with:
-      image_name: ${{ github.repository_owner }}/godoxy-agent
-      tag: nightly
-      target: agent
