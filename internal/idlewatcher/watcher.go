@@ -633,7 +633,68 @@ func (w *Watcher) hasRunningDependent() bool {
 			}
 		}
 	}
+	return w.entrypointRouteDependsOn()
+}
+
+// entrypointRouteDependsOn reports whether an entrypoint route depends on w's
+// container. Covers always-on routes, which have no watcher in watcherMap.
+// Edges are resolved like NewWatcher resolves them; a down route does not pin.
+func (w *Watcher) entrypointRouteDependsOn() bool {
+	ep := entrypoint.FromCtx(w.Task().Context())
+	if ep == nil {
+		return false
+	}
+	healthMap := ep.GetHealthInfoSimple()
+	for r := range ep.IterRoutes {
+		if cont := r.ContainerInfo(); cont == nil || cont.ContainerID == w.cfg.Key() {
+			// skip routes of the watcher's own container
+			continue
+		}
+		if !w.routeDependsOnContainer(r) {
+			continue
+		}
+		if status, ok := healthMap[r.Name()]; ok && status == health.StatusUnhealthy {
+			continue
+		}
+		return true
+	}
 	return false
+}
+
+// routeDependsOnContainer reports whether r's container declares a
+// dependency on w's container.
+func (w *Watcher) routeDependsOnContainer(r routing.Route) bool {
+	cont := r.ContainerInfo()
+	proj := docker.DockerComposeProject(cont)
+	for _, depEntry := range docker.Dependencies(cont) {
+		depName := depEntry
+		if i := strings.IndexByte(depName, ':'); i >= 0 {
+			depName = depName[:i]
+		}
+		if depName == "" {
+			continue
+		}
+		depRoute, ok := w.resolveDepRoute(r, proj, depName)
+		if !ok {
+			continue
+		}
+		if depCont := depRoute.ContainerInfo(); depCont != nil && depCont.ContainerID == w.cfg.Key() {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *Watcher) resolveDepRoute(r routing.Route, proj, depName string) (routing.Route, bool) {
+	if proj != "" {
+		if depRoute, ok := r.GetProvider().FindService(proj, depName); ok {
+			return depRoute, true
+		}
+	}
+	if ep := entrypoint.FromCtx(w.Task().Context()); ep != nil {
+		return ep.GetRoute(depName)
+	}
+	return nil, false
 }
 
 func (w *Watcher) stopByMethod() error {
