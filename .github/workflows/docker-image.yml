@@ -51,9 +51,11 @@ jobs:
           fetch-depth: 0
 
       - name: Prepare
+        id: prep
         run: |
           platform=${{ matrix.platform }}
           echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+          echo "IMAGE_NAME=$(echo '${{ inputs.image_name }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
 
       - name: Compute VERSION for build
         run: |
@@ -80,7 +82,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.REGISTRY }}/${{ inputs.image_name }}
+          images: ${{ env.REGISTRY }}/${{ steps.prep.outputs.IMAGE_NAME }}
           tags: |
             type=raw,value=${{ inputs.tag }},event=branch
             type=ref,event=tag
@@ -105,13 +107,13 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           file: ${{ env.DOCKERFILE }}
           target: ${{ inputs.target }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ inputs.image_name }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ steps.prep.outputs.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           cache-from: |
             type=gha,scope=${{ github.workflow }}-${{ env.CACHE_VARIANT }}-${{ env.PLATFORM_PAIR }}
-            type=registry,ref=${{ env.REGISTRY }}/${{ inputs.image_name }}:buildcache-${{ env.CACHE_VARIANT }}-${{ env.PLATFORM_PAIR }}
+            type=registry,ref=${{ env.REGISTRY }}/${{ steps.prep.outputs.IMAGE_NAME }}:buildcache-${{ env.CACHE_VARIANT }}-${{ env.PLATFORM_PAIR }}
           cache-to: |
             type=gha,scope=${{ github.workflow }}-${{ env.CACHE_VARIANT }}-${{ env.PLATFORM_PAIR }},mode=max
-            type=registry,ref=${{ env.REGISTRY }}/${{ inputs.image_name }}:buildcache-${{ env.CACHE_VARIANT }}-${{ env.PLATFORM_PAIR }},mode=max
+            type=registry,ref=${{ env.REGISTRY }}/${{ steps.prep.outputs.IMAGE_NAME }}:buildcache-${{ env.CACHE_VARIANT }}-${{ env.PLATFORM_PAIR }},mode=max
           build-args: |
             VERSION=${{ env.VERSION_FOR_BUILD }}
             SHADOWTREE_ARGS=${{ env.SHADOWTREE_ARGS }}
@@ -120,7 +122,7 @@ jobs:
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v1
         with:
-          subject-name: ${{ env.REGISTRY }}/${{ inputs.image_name }}
+          subject-name: ${{ env.REGISTRY }}/${{ steps.prep.outputs.IMAGE_NAME }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
@@ -158,11 +160,15 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Prepare
+        id: prep
+        run: echo "IMAGE_NAME=$(echo '${{ inputs.image_name }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ inputs.image_name }}
+          images: ${{ env.REGISTRY }}/${{ steps.prep.outputs.IMAGE_NAME }}
           tags: |
             type=raw,value=${{ inputs.tag }},event=branch
             type=ref,event=tag
@@ -179,8 +185,8 @@ jobs:
         working-directory: ${{ env.DIGEST_PATH }}
         run: |
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ inputs.image_name }}@sha256:%s ' *)
+            $(printf '${{ env.REGISTRY }}/${{ steps.prep.outputs.IMAGE_NAME }}@sha256:%s ' *)
 
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ inputs.image_name }}:${{ steps.meta.outputs.version }}
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ steps.prep.outputs.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
