@@ -585,9 +585,33 @@ func (w *Watcher) stopDependencies() error {
 
 	errs := errgroup.Group{}
 	for _, dep := range dependencies {
+		if dep.Watcher.inUseByOtherWatchers(w) {
+			continue
+		}
 		errs.Go(dep.stopByMethod)
 	}
 	return errs.Wait()
+}
+
+// inUseByOtherWatchers reports whether a running watcher other than self
+// directly depends on w. A dependency shared by several routes is kept running
+// until the last of them stops; wake is transitive, so a sleeping dependent
+// wakes it again on demand.
+func (w *Watcher) inUseByOtherWatchers(self *Watcher) bool {
+	watcherMapMu.RLock()
+	defer watcherMapMu.RUnlock()
+
+	for _, other := range watcherMap {
+		if other == self || !other.running() {
+			continue
+		}
+		if slices.ContainsFunc(other.directDependencies(), func(dep *dependency) bool {
+			return dep.Watcher == w
+		}) {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *Watcher) stopByMethod() error {

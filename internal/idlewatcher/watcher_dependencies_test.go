@@ -419,3 +419,58 @@ func TestNewWatcherReloadRefreshesDependencySettings(t *testing.T) {
 		})
 	}
 }
+
+type stopRecordingProvider struct {
+	stops atomic.Int64
+}
+
+func (*stopRecordingProvider) ContainerPause(context.Context) error   { return nil }
+func (*stopRecordingProvider) ContainerUnpause(context.Context) error { return nil }
+func (*stopRecordingProvider) ContainerStart(context.Context) error   { return nil }
+func (*stopRecordingProvider) ContainerKill(context.Context, idlewatchertypes.Signal) error {
+	return nil
+}
+func (p *stopRecordingProvider) ContainerStop(context.Context, idlewatchertypes.Signal, int) error {
+	p.stops.Add(1)
+	return nil
+}
+func (*stopRecordingProvider) ContainerStatus(context.Context) (idlewatchertypes.ContainerStatus, error) {
+	return idlewatchertypes.ContainerStatusRunning, nil
+}
+func (*stopRecordingProvider) Watch(context.Context) (<-chan watcherEvents.Event, <-chan error) {
+	return nil, nil
+}
+func (*stopRecordingProvider) Close() {}
+
+func TestStopDependenciesKeepsSharedDependency(t *testing.T) {
+	shared := newTestWatcher(t)
+	dependent := newTestWatcher(t)
+	other := newTestWatcher(t)
+
+	shared.cfg.StopMethod = idlewatchertypes.ContainerStopMethodStop
+	sharedProvider := &stopRecordingProvider{}
+	shared.provider.Store(sharedProvider)
+	shared.state.Store(&containerState{status: idlewatchertypes.ContainerStatusRunning})
+
+	dependent.dependsOn = []*dependency{{Watcher: shared}}
+	other.dependsOn = []*dependency{{Watcher: shared}}
+
+	for _, w := range []*Watcher{shared, dependent, other} {
+		watcherMapMu.Lock()
+		watcherMap[w.cfg.Key()] = w
+		watcherMapMu.Unlock()
+		t.Cleanup(func() {
+			watcherMapMu.Lock()
+			delete(watcherMap, w.cfg.Key())
+			watcherMapMu.Unlock()
+		})
+	}
+
+	other.state.Store(&containerState{status: idlewatchertypes.ContainerStatusRunning})
+	require.NoError(t, dependent.stopDependencies())
+	require.Zero(t, sharedProvider.stops.Load(), "shared dependency stopped while another dependent runs")
+
+	other.state.Store(&containerState{status: idlewatchertypes.ContainerStatusStopped})
+	require.NoError(t, dependent.stopDependencies())
+	require.EqualValues(t, 1, sharedProvider.stops.Load(), "shared dependency not stopped after the last dependent stopped")
+}
